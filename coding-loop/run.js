@@ -10,20 +10,23 @@
  *   node coding-loop/run.js --repo org/name --issue 12 --implement
  *   node coding-loop/run.js --repo org/name --issue 12 --implement --open-pr
  *
- * --post requires CONDUCTOR_GH_TOKEN.
- * --implement / --open-pr require AGENT_GH_TOKEN.
- * --open-pr also requires XAI_API_KEY and calls Grok, then opens the PR.
+ * --post requires CONDUCTOR_GH_TOKEN or CONDUCTOR_APP_ID+CONDUCTOR_APP_PRIVATE_KEY.
+ * --implement / --open-pr require AGENT_GH_TOKEN (or AGENT_GH_TOKEN_CLASSIC
+ * when AGENT_GH_USE_CLASSIC=1).
+ * --open-pr also requires XAI_API_KEY or AI_GW_API_TOKEN+AI_GW_BASE_URL, then opens the PR.
  * --live-critic requires ADC (GCP_ACCESS_TOKEN or gcloud) and calls Gemini.
  */
 
 const fs = require('fs');
 const path = require('path');
 const { gh } = require('../scripts/github-client.js');
-const { issueFromGitHub } = require('./intake.js');
+const { issueFromGitHub, labelsOf } = require('./intake.js');
 const { completeThroughStageB, loadRouting } = require('./plan.js');
 const { assertProducerToken, openImplementationPr, prepareImplementation } = require('./dispatch.js');
-const { critiquePlanLive } = require('./critic.js');
+const { resolveProducerToken } = require('../scripts/agent-token.js');
+const { critiquePlanLive, revisePlanLive } = require('./critic.js');
 const { assertWriterKey, draftChanges } = require('./writer.js');
+const { mintGithubAppInstallationToken } = require('../scripts/github-app-token.js');
 const { scanIssueBody } = require('./scan.js');
 const { prepareReview } = require('./stage-d.js');
 const { resolveProfile } = require('./profile.js');
@@ -129,17 +132,35 @@ function loadTenant(relPath) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function conductorToken() {
-  const token = process.env.CONDUCTOR_GH_TOKEN;
-  if (token) return token;
+function conductorToken(env = process.env) {
+  return (env && env.CONDUCTOR_GH_TOKEN) || '';
+}
+
+async function resolveConductorToken(env = process.env, { owner } = {}) {
+  if (env && env.CONDUCTOR_GH_TOKEN) return env.CONDUCTOR_GH_TOKEN;
+  if (env && env.CONDUCTOR_APP_ID && env.CONDUCTOR_APP_PRIVATE_KEY) {
+    return mintGithubAppInstallationToken({
+      appId: env.CONDUCTOR_APP_ID,
+      privateKey: env.CONDUCTOR_APP_PRIVATE_KEY,
+      owner,
+    });
+  }
   return '';
 }
 
-function readToken() {
-  return conductorToken()
-    || process.env.GH_TOKEN
-    || process.env.GITHUB_TOKEN
+function readToken(env = process.env) {
+  return conductorToken(env)
+    || (env && env.GH_TOKEN)
+    || (env && env.GITHUB_TOKEN)
     || '';
+}
+
+// Reads use the conductor token already resolved above, including an
+// installation token minted from the App. --post only controls the comment
+// and the label; it must not be required to keep that token (Decision
+// [2026-10-03-0002]).
+function issueReadToken(conductor, env = process.env) {
+  return conductor || readToken(env);
 }
 
 async function implementFromPlan({ args, issue, plan }) {
@@ -147,7 +168,15 @@ async function implementFromPlan({ args, issue, plan }) {
   const prepared = prepareImplementation({ issue, plan, branches });
   if (!args.openPr || prepared.status !== 'ready') return prepared;
 
-  const drafted = await draftChanges({ issue, plan, env: process.env, profile: args.profile });
+  const drafted = await draftChanges({
+    issue,
+    plan,
+    env: process.env,
+    profile: args.profile,
+    repo: args.repo,
+    base: prepared.base,
+    token: resolveProducerToken(process.env).token,
+  });
   if (drafted.status === 'refused') {
     return {
       ...prepared,
@@ -163,7 +192,7 @@ async function implementFromPlan({ args, issue, plan }) {
     issue,
     plan,
     branches,
-    token: process.env.AGENT_GH_TOKEN,
+    token: resolveProducerToken(process.env).token,
     files: drafted.files,
     model: drafted.model,
   });
@@ -188,8 +217,16 @@ async function main() {
     process.exit(2);
   }
 
-  if (args.post && !conductorToken()) {
-    process.stderr.write('✖ --post requires CONDUCTOR_GH_TOKEN. Refusing AGENT_GH_TOKEN / reviewer tokens (identity split).\n');
+  const repoOwner = String(args.repo).split('/')[0];
+  let conductor = '';
+  try {
+    conductor = await resolveConductorToken(process.env, { owner: repoOwner });
+  } catch (err) {
+    process.stderr.write(`✖ ${err.message}\n`);
+    process.exit(2);
+  }
+  if (args.post && !conductor) {
+    process.stderr.write('✖ --post requires CONDUCTOR_GH_TOKEN or CONDUCTOR_APP_ID+CONDUCTOR_APP_PRIVATE_KEY. Refusing AGENT_GH_TOKEN / reviewer tokens (identity split).\n');
     process.exit(2);
   }
 
@@ -211,9 +248,9 @@ async function main() {
     }
   }
 
-  const token = args.post ? conductorToken() : readToken();
+  const token = issueReadToken(conductor);
   if (!token) {
-    process.stderr.write('✖ Need a GitHub token to read the issue (CONDUCTOR_GH_TOKEN, GH_TOKEN, or GITHUB_TOKEN).\n');
+    process.stderr.write('✖ Need a conductor token to read the issue (CONDUCTOR_APP_ID + CONDUCTOR_APP_PRIVATE_KEY, or CONDUCTOR_GH_TOKEN). GH_TOKEN and GITHUB_TOKEN also work for a local read.\n');
     process.exit(2);
   }
 
@@ -229,18 +266,14 @@ async function main() {
     budget: gateInputs.budget,
     routing: loadRouting(repoRoot),
     critic: args.liveCritic ? critiquePlanLive : undefined,
+    revise: args.liveCritic
+      ? (plan, findings, prompt) => revisePlanLive(plan, findings, { prompt })
+      : undefined,
     profile: args.profile,
+    repoRoot,
   });
 
   if (args.post && intake.tier !== 'SKIPPED') {
-    const label = (plan.status === 'accepted' || plan.status === 'needs-info')
-      ? plan.label
-      : intake.label;
-    await gh(`/repos/${args.repo}/issues/${args.issue}/labels`, {
-      token: conductorToken(),
-      method: 'POST',
-      body: { labels: [label] },
-    });
     const comment = plan.status === 'accepted'
       ? plan.plan
       : plan.status === 'needs-info'
@@ -248,7 +281,7 @@ async function main() {
         : (intake.questions || []).map((q) => `- ${q}`).join('\n');
     if (comment) {
       await gh(`/repos/${args.repo}/issues/${args.issue}/comments`, {
-        token: conductorToken(),
+        token: conductor,
         method: 'POST',
         body: { body: comment },
       });
@@ -259,6 +292,24 @@ async function main() {
     ? await implementFromPlan({ args, issue, plan })
     : null;
   const review = prepareReview({ implementation });
+  const label = activeLoopLabel({
+    post: args.post,
+    intake,
+    plan,
+    implementation,
+    review,
+  });
+  if (label && conductor) {
+    await syncNoemiLabel({
+      repo: args.repo,
+      number: args.issue,
+      label,
+      current: issue.labels,
+      token: conductor,
+    });
+  } else if (label) {
+    process.stderr.write('✖ conductor token missing; left the issue label unchanged.\n');
+  }
 
   process.stderr.write(`${JSON.stringify({
     task: 'Issue-loop Stage A through Stage C',
@@ -276,14 +327,49 @@ async function main() {
     risks: [
       intake.mode === 'heuristic' ? 'sufficiency is heuristic until the Stage A model is wired' : null,
       plan.mode === 'heuristic' && plan.status === 'accepted' ? 'Stage B′ used the structural critic; pass --live-critic for Gemini' : null,
-      plan.status === 'needs-info' ? 'Stage B′ hit the cycle limit' : null,
+      plan.status === 'needs-info'
+        ? (Number.isInteger(plan.maxCycles) && plan.cycles < plan.maxCycles
+          ? 'Stage B′ stopped because the plan was not revised'
+          : 'Stage B′ hit the cycle limit')
+        : null,
       implementation && implementation.status === 'ready' && implementation.opened !== true
         ? 'Stage C envelope ready; pass --open-pr to draft with Grok and open as noemi-agent'
         : null,
     ].filter(Boolean),
-    result: (implementation && implementation.label) || plan.label || intake.label,
+    result: label || plan.label || intake.label,
   })}\n`);
   process.stdout.write(`${JSON.stringify({ intake, plan, implementation, review }, null, 2)}\n`);
+}
+
+function activeLoopLabel({ post, intake, plan, implementation, review } = {}) {
+  if (implementation && implementation.opened) {
+    if (review && review.status === 'delegated' && review.label) return review.label;
+    return implementation.label || '';
+  }
+  if (!post || !intake || intake.tier === 'SKIPPED') return '';
+  if (plan && (plan.status === 'accepted' || plan.status === 'needs-info')) return plan.label || '';
+  return intake.label || '';
+}
+
+async function syncNoemiLabel({ repo, number, label, current, token, ghImpl } = {}) {
+  const call = ghImpl || gh;
+  const names = labelsOf({ labels: current });
+  for (const name of names) {
+    if (!name.startsWith('noemi:') || name === label) continue;
+    const encoded = encodeURIComponent(name);
+    try {
+      await call(`/repos/${repo}/issues/${number}/labels/${encoded}`, { token, method: 'DELETE' });
+    } catch (err) {
+      if (!err || err.status !== 404) throw err;
+    }
+  }
+  if (label && !names.includes(label)) {
+    await call(`/repos/${repo}/issues/${number}/labels`, {
+      token,
+      method: 'POST',
+      body: { labels: [label] },
+    });
+  }
 }
 
 function exitCodeForError(err) {
@@ -298,5 +384,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, buildGateInputs, resolveScanInput, loadTenant, assertRepoIssue, exitCodeForError, implementFromPlan,
+  parseArgs, buildGateInputs, resolveScanInput, loadTenant, assertRepoIssue, exitCodeForError, implementFromPlan, issueReadToken,
+  activeLoopLabel, syncNoemiLabel,
 };

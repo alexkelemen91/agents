@@ -14,7 +14,7 @@ const {
 } = require('../scripts/resolve-gemini-model.js');
 const { getAccessToken } = require('../scripts/gcp-token.js');
 const { withRetry } = require('../scripts/resilience_helpers.js');
-const { critiquePlan } = require('./plan.js');
+const { critiquePlan, buildPlanRevisionPrompt } = require('./plan.js');
 const { httpError, modelRetryOptions } = require('./http.js');
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low'];
@@ -58,11 +58,20 @@ function buildCriticPrompt(plan) {
 
 function normalizeModelCritique(reply, structural) {
   const findings = validateFindings(reply && reply.findings);
-  if (String(reply && reply.verdict).toLowerCase() === 'fail' && findings.length === 0) {
+  const verdict = String(reply && reply.verdict).toLowerCase();
+  if (verdict === 'fail' && !findings.some((item) => BLOCKING.includes(item.severity))) {
+    // An explicit fail is never downgraded to pass by its own finding list.
     findings.push({
       severity: 'high',
       gate: 'framing',
-      claim: 'Critic returned fail without a finding.',
+      claim: 'Critic returned fail without a high or critical finding.',
+    });
+  } else if (verdict !== 'pass' && verdict !== 'fail') {
+    // A missing or unknown verdict is a malformed reply, never an acceptance.
+    findings.push({
+      severity: 'high',
+      gate: 'framing',
+      claim: `Critic reply had no usable verdict (${reply && reply.verdict != null ? JSON.stringify(reply.verdict) : 'missing'}).`,
     });
   }
   const combined = [...(structural.findings || []), ...findings];
@@ -151,6 +160,29 @@ async function critiquePlanLive(plan, opts = {}) {
   return normalizeModelCritique(reply, structural);
 }
 
+async function revisePlanLive(plan, findings, opts = {}) {
+  const prompt = opts.prompt || buildPlanRevisionPrompt(plan, findings, opts.issueText || '');
+  const invoke = typeof opts.callModel === 'function'
+    ? () => opts.callModel(plan, findings, prompt)
+    : async () => {
+      const cfg = opts.cfg || backendConfig();
+      const token = opts.token || await getAccessToken();
+      const model = opts.model || await resolveCriticModel({ token, cfg, pin: opts.pin });
+      return callGeminiJson({
+        model,
+        prompt,
+        token,
+        cfg,
+        fetchImpl: opts.fetchImpl,
+      });
+    };
+  const reply = await withRetry(invoke, modelRetryOptions());
+  return {
+    plan: reply && typeof reply.plan === 'string' ? reply.plan : '',
+    files: Array.isArray(reply && reply.files) ? reply.files.map((file) => String(file)) : [],
+  };
+}
+
 module.exports = {
   BLOCKING,
   SEVERITIES,
@@ -158,6 +190,7 @@ module.exports = {
   callGeminiJson,
   critiquePlanLive,
   normalizeModelCritique,
+  revisePlanLive,
   resolveCriticModel,
   validateFindings,
 };

@@ -13,7 +13,7 @@ It provides a structured blueprint for building a **governed Virtual Workforce**
 * 31 AI agent specifications across 9 domains (coding, communication, education, engineering, guardian, infrastructure, marketing, operations, product)
 * 16 reusable skills covering classification, verification, reporting, security, orchestration, and operations
 * 17 MCP protocol definitions for safe integration with Google Workspace (Drive, Docs, Sheets, Slides, Calendar, Gmail, Meet, Chat, Keep, Forms, Contacts, Admin), Slack, GitHub, n8n, web search, and unified logging (Loki/Grafana)
-* Governance frameworks aligned with **Phase 0 Security**, **Gartner AI TRiSM**, and the **4D AI Fluency Framework** (Delegation, Description, Discernment, Diligence)
+* Governance frameworks aligned with **Phase 0 Security**, **AI TRiSM** (a framework defined by Gartner®, Inc.), and the **4D AI Fluency Framework** (Delegation, Description, Discernment, Diligence)
 * Value lenses and operating profiles that let teams tune agents to specific business contexts without forking the specs
 
 These components are designed to move organizations from **unstructured, high-risk AI usage** to a **controlled, auditable, and scalable operating model**.
@@ -31,6 +31,16 @@ This enables them to:
 * customize agents, workflows, and integrations for their specific business context
 * protect internal logic and intellectual property
 * move at their own pace without blocking on upstream changes
+
+### GitHub Packages on a private clone
+
+A copy of this repository still contains `.github/workflows/publish-gmail-ea.yml`. On your org that workflow pushes `ghcr.io/<your-org>/gmail-executive-assistant`. GitHub creates that package **private**. Keep it private for private agent work.
+
+1. In the GitHub org: **Settings → Packages → Package creation**. Leave **Public** unchecked. **Private** stays available, so members can still publish packages only your org can pull.
+2. Do not use a package's **Danger Zone → Change visibility → Public** unless that image is meant to be pulled without credentials. GitHub will not let you make that package private again.
+3. The workflow does not change visibility. On `project-noemi` it requires an anonymous `docker manifest inspect` because the reference image is public. On any other owner it **fails** if that anonymous inspect succeeds, so a copied workflow cannot quietly ship a world-pullable image.
+
+Details: [docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#github-packages-on-a-private-clone). Decision [2026-10-05-0005].
 
 In practice:
 
@@ -226,6 +236,14 @@ All reference tooling and Docker images use **Node.js 24** as the technical base
 ---
 
 > **Working in this repo?** `CLAUDE.md` and `GEMINI.md` are **generated** context files — built from `templates/context/` plus the active agents, skills, and MCP protocols. After changing any of those sources, run `node scripts/generate_all.js` to refresh them. Don't hand-edit `CLAUDE.md` or `GEMINI.md`: regeneration overwrites manual changes, and CI checks them against golden fixtures.
+
+---
+
+## Attribution
+
+> Attribution: AI TRiSM (AI trust, risk and security management) is a framework defined by Gartner, Inc. Gartner® is a registered trademark and service mark of Gartner, Inc. and/or its affiliates in the U.S. and internationally.
+
+The 4 Ds of AI Fluency — Dakan, R. and Feller, J., "Framework for AI Fluency," v1.1, CC BY-NC-ND 4.0.
 
 ---
 
